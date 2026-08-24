@@ -1,0 +1,172 @@
+import pandas as pd
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+
+# ================= CONFIG =================
+ARQUIVO = "visitantes.xlsx"
+URL_LOGIN = "https://hcm.storer.com.br/auth/"
+USUARIO = ""
+SENHA = ""
+EMPRESA_BASE = ""
+
+# ================= FUNÇÕES =================
+
+def aceitar_cookies(page):
+    try:
+        botao = page.locator("button[data-cy='cookie-accept']")
+        if botao.is_visible(timeout=5000):
+            botao.click()
+            page.wait_for_timeout(2000)
+            print("🍪 Cookies aceitos")
+    except:
+        pass
+
+def login_via_tab(page):
+    page.wait_for_timeout(3000)
+    page.keyboard.press("Tab")
+    page.keyboard.type(USUARIO)
+    page.keyboard.press("Tab")
+    page.keyboard.type(SENHA)
+    page.keyboard.press("Tab")
+    page.keyboard.press("Tab")
+    page.keyboard.press("Tab")
+    page.keyboard.press("Enter")
+    page.wait_for_timeout(5000)
+
+def selecionar_base(page):
+    campo = page.locator("div.v-field:has(label:has-text('Bases')) input")
+    campo.click()
+    page.keyboard.type(EMPRESA_BASE)
+    page.keyboard.press("ArrowDown")
+    page.keyboard.press("Enter")
+    page.wait_for_selector(f"text={EMPRESA_BASE}")
+    page.locator("button:has-text('Selecionar')").click()
+    page.wait_for_timeout(4000)
+
+def abrir_menu_visitantes(page, primeira_vez):
+    if primeira_vez:
+        page.locator("button[aria-haspopup='menu']").first.click()
+        page.wait_for_timeout(1000)
+        page.locator("div.v-list-item-title:has-text('Controle de Acesso')").click()
+        page.wait_for_timeout(500)
+        page.locator("div.v-list-item-title:has-text('Visitantes')").click()
+        page.wait_for_timeout(1500)
+
+    page.locator("button:has-text('Novo Visitante')").click()
+    page.wait_for_timeout(2000)
+    page.locator("button:has-text('Dados do Visitante')").click()
+    page.wait_for_timeout(1000)
+
+def preencher_visitante(page, row):
+    page.fill("div.v-field:has(label:has-text('CPF')) input", str(row["CPF"]))
+    page.fill("div.v-field:has(label:has-text('Nome')) input", str(row["NOME"]))
+
+def tratar_popup_duplicidade(page):
+    try:
+        page.locator("text=já existe cadastro").wait_for(timeout=3000)
+        print("⚠️ Cadastro já existe")
+        page.locator("button:has-text('Cancelar')").click()
+        page.wait_for_timeout(1500)
+        return True
+    except PlaywrightTimeoutError:
+        return False
+
+def tratar_popup_colaborador(page):
+    try:
+        page.locator("text=Colaborador encontrado").wait_for(timeout=3000)
+        print("⚠️ Colaborador encontrado")
+        page.locator("button:has-text('Cancelar')").click()
+        page.wait_for_timeout(1500)
+        return True
+    except PlaywrightTimeoutError:
+        return False
+
+def clicar_cancelar_principal(page):
+    try:
+        page.locator("span.v-btn__content:has-text('Cancelar')") \
+            .locator("xpath=ancestor::button[not(@disabled)]") \
+            .last.click(timeout=3000)
+        print("↩️ Cancelar (principal) clicado")
+        return True
+    except:
+        return False
+
+def salvar_e_sair(page):
+    page.locator("button:has-text('Salvar')").first.click()
+    page.wait_for_timeout(2000)
+
+    if tratar_popup_colaborador(page):
+        page.locator("button:has-text('Salvar')").first.click()
+        page.wait_for_timeout(2000)
+
+    if tratar_popup_duplicidade(page):
+        return "JA_EXISTE"
+
+    if clicar_cancelar_principal(page):
+        page.wait_for_timeout(1500)
+        return "OK"
+
+    try:
+        page.locator("button:has-text('Voltar')").click(timeout=2000)
+    except:
+        try:
+            page.locator("button:has-text('Fechar')").click(timeout=2000)
+        except:
+            try:
+                page.locator("button[aria-label='Close'], i.mdi-close").click(timeout=2000)
+            except:
+                page.keyboard.press("Escape")
+
+    page.wait_for_timeout(1500)
+    return "OK"
+
+# ================= EXECUÇÃO =================
+
+df = pd.read_excel(ARQUIVO, dtype=str).fillna("")
+
+if "STATUS" not in df.columns:
+    df["STATUS"] = ""
+if "ERRO" not in df.columns:
+    df["ERRO"] = ""
+
+df["STATUS"] = df["STATUS"].astype(str)
+df["ERRO"] = df["ERRO"].astype(str)
+
+with sync_playwright() as p:
+    browser = p.chromium.launch(headless=False)
+    page = browser.new_page()
+    page.goto(URL_LOGIN)
+
+    aceitar_cookies(page)
+    login_via_tab(page)
+    selecionar_base(page)
+
+    primeira_vez = True
+
+    for index, row in df.iterrows():
+        try:
+            if str(row.get("STATUS")).upper() in ["OK", "JA_EXISTE"]:
+                continue
+
+            abrir_menu_visitantes(page, primeira_vez)
+            primeira_vez = False
+
+            preencher_visitante(page, row)
+            resultado = salvar_e_sair(page)
+
+            if resultado == "JA_EXISTE":
+                df.at[index, "STATUS"] = "JA_EXISTE"
+                df.at[index, "ERRO"] = "Cadastro já existente"
+                print(f"⚠️ Linha {index+2} já existia")
+            else:
+                df.at[index, "STATUS"] = "OK"
+                df.at[index, "ERRO"] = ""
+                print(f"✅ Linha {index+2} criada")
+
+        except Exception as e:
+            erro_msg = str(e)[:200]
+            df.at[index, "STATUS"] = "ERRO"
+            df.at[index, "ERRO"] = erro_msg
+            print(f"❌ Erro linha {index+2}: {erro_msg}")
+
+    df.to_excel(ARQUIVO, index=False)
+    browser.close()
