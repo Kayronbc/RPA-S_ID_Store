@@ -1,0 +1,203 @@
+import pandas as pd
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+# ================= CONFIGURAÇÕES =================
+ARQUIVO = "emails_funcionarios.xlsx"  # CPF (A), EMAIL (B), LOGIN (C)
+URL_LOGIN = "https://hcm.storer.com.br/auth/"
+
+EMPRESA_BASE = "CENTRAL ENERGÉTICA VALE DO SAPUCAI LTDA"
+
+MSG_SUCESSO = "Funcionário atualizado com sucesso!"
+
+MENSAGENS_NAO_ENCONTRADO = [
+    "Nenhum registro encontrado",
+    "Nenhum resultado encontrado",
+    "Nenhum colaborador encontrado",
+    "No collaborator found",
+    "Colaborador não encontrado",
+    "Colaborador não localizado",
+]
+
+# ================= FUNÇÕES =================
+def limpar_texto(x: str) -> str:
+    return "" if x is None else str(x).strip()
+
+def confirmar_autocomplete(page, valor: str):
+    page.keyboard.type(valor, delay=60)
+    page.wait_for_timeout(250)
+    page.keyboard.press("ArrowDown")
+    page.wait_for_timeout(150)
+    page.keyboard.press("Enter")
+    page.wait_for_timeout(400)
+
+def selecionar_base(page, nome_base: str):
+    campo_bases = page.locator("div.v-field:has(label:has-text('Bases')) input")
+    campo_bases.click()
+    confirmar_autocomplete(page, nome_base)
+
+    page.wait_for_selector(f"div.v-card-title:has-text('{nome_base}')", timeout=15000)
+    page.locator(
+        f"div.v-card:has(div.v-card-title:has-text('{nome_base}')) "
+        "button:has-text('Selecionar')"
+    ).click()
+
+    page.wait_for_timeout(2500)
+
+def abrir_menu_contratar_funcionarios(page, primeira_vez: bool):
+    if not primeira_vez:
+        return
+
+    page.evaluate("window.scrollTo(0, 0)")
+    page.wait_for_timeout(500)
+
+    page.locator("button[aria-haspopup='menu']").first.click()
+    page.wait_for_timeout(800)
+
+    page.locator("div.v-list-item-title:has-text('Contratar')").click()
+    page.wait_for_timeout(400)
+
+    page.locator("div.v-list-item-title:has-text('Funcionários')").click()
+    page.wait_for_timeout(1200)
+
+def aceitar_cookies_se_existir(page):
+    try:
+        btn = page.locator('button[data-cy="cookie-accept"]').first
+        if btn.count() > 0 and btn.is_visible():
+            btn.click(force=True)
+            page.wait_for_timeout(500)
+    except:
+        pass
+
+def filtrar_por_cpf(page, cpf: str):
+    campo_busca = page.locator("div.v-field:has(label:has-text('Nome/CPF/PIS')) input").first
+    campo_busca.click()
+    campo_busca.fill("")
+    page.keyboard.type(cpf, delay=40)
+
+    page.keyboard.press("Enter")
+    page.wait_for_timeout(900)
+
+    try:
+        page.locator("button:has-text('Filtrar')").first.click(timeout=1500)
+        page.wait_for_timeout(900)
+    except:
+        pass
+
+def existe_mensagem(page, textos, timeout_ms=1200) -> str | None:
+    for t in textos:
+        try:
+            page.wait_for_selector(f"text={t}", timeout=timeout_ms)
+            return t
+        except:
+            continue
+    return None
+
+def abrir_edicao_primeiro_resultado(page):
+    icone = page.locator("i.mdi-pencil[role='button']").first
+    icone.wait_for(state="visible", timeout=8000)
+    icone.click()
+    page.wait_for_timeout(900)
+
+def atualizar_email(page, email_novo: str):
+    # Campo EMAIL via label (sem depender de ID)
+    campo_email = page.locator("div.v-field:has(label:has-text('Email')) input").first
+    campo_email.wait_for(state="visible", timeout=10000)
+
+    campo_email.click()
+    campo_email.fill("")
+    page.keyboard.type(email_novo, delay=35)
+
+    page.locator("button:has-text('Atualizar')").first.click()
+    page.wait_for_timeout(900)
+
+    try:
+        page.wait_for_selector(f"text={MSG_SUCESSO}", timeout=8000)
+        return True, MSG_SUCESSO
+    except:
+        msg_nf = existe_mensagem(page, MENSAGENS_NAO_ENCONTRADO, timeout_ms=800)
+        if msg_nf:
+            return False, msg_nf
+        return False, "Não consegui confirmar a mensagem de sucesso."
+
+# ================= PLANILHA =================
+df = pd.read_excel(ARQUIVO, dtype=str)
+
+# Garantir colunas
+colunas_esperadas = ["CPF", "E-MAIL", "LOGIN"]
+for col in colunas_esperadas:
+    if col not in df.columns:
+        raise ValueError(f"Coluna obrigatória não encontrada: {col}")
+
+for col in ["STATUS", "ERRO"]:
+    if col not in df.columns:
+        df[col] = ""
+    df[col] = df[col].astype(str)
+
+# ================= PLAYWRIGHT =================
+with sync_playwright() as p:
+    browser = p.chromium.launch(headless=False)
+    page = browser.new_page()
+
+    page.goto(URL_LOGIN, wait_until="domcontentloaded")
+    aceitar_cookies_se_existir(page)
+
+    print("🟡 Faça o login manualmente.")
+    page.wait_for_selector("div.v-field:has(label:has-text('Bases')) input", timeout=10 * 60 * 1000)
+
+    selecionar_base(page, EMPRESA_BASE)
+
+    primeira_vez_menu = True
+
+    for index, row in df.iterrows():
+        if str(row["STATUS"]).strip().upper() == "OK":
+            continue
+
+        cpf = limpar_texto(row.get("CPF", ""))
+        email = limpar_texto(row.get("E-MAIL", ""))
+
+        if cpf == "" or email == "":
+            df.at[index, "STATUS"] = "ERRO"
+            df.at[index, "ERRO"] = "CPF ou E-MAIL vazio"
+            df.to_excel(ARQUIVO, index=False)
+            print(f"❌ Linha {index + 2}: CPF/E-MAIL vazio")
+            continue
+
+        try:
+            abrir_menu_contratar_funcionarios(page, primeira_vez_menu)
+            primeira_vez_menu = False
+
+            filtrar_por_cpf(page, cpf)
+
+            msg_nf = existe_mensagem(page, MENSAGENS_NAO_ENCONTRADO, timeout_ms=1200)
+            if msg_nf:
+                df.at[index, "STATUS"] = "ERRO"
+                df.at[index, "ERRO"] = msg_nf
+                df.to_excel(ARQUIVO, index=False)
+                print(f"❌ Linha {index + 2}: {cpf} -> {msg_nf}")
+                continue
+
+            abrir_edicao_primeiro_resultado(page)
+            ok, msg = atualizar_email(page, email)
+
+            df.at[index, "STATUS"] = "OK" if ok else "ERRO"
+            df.at[index, "ERRO"] = "" if ok else msg
+
+            if ok:
+                print(f"✅ Linha {index + 2}: {cpf} -> Email atualizado para {email}")
+            else:
+                print(f"❌ Linha {index + 2}: {cpf} -> {msg}")
+
+        except PWTimeout as e:
+            df.at[index, "STATUS"] = "ERRO"
+            df.at[index, "ERRO"] = f"Timeout: {str(e)}"
+            print(f"❌ Linha {index + 2}: Timeout")
+
+        except Exception as e:
+            df.at[index, "STATUS"] = "ERRO"
+            df.at[index, "ERRO"] = str(e)
+            print(f"❌ Linha {index + 2}: {e}")
+
+        df.to_excel(ARQUIVO, index=False)
+
+    browser.close()
+    print("🏁 Finalizado.")
