@@ -1,0 +1,161 @@
+import pandas as pd
+from playwright.sync_api import sync_playwright, TimeoutError
+
+# ================= CONFIGURAÇÕES =================
+ARQUIVO = "dados.xlsx"
+URL_LOGIN = "https://hcm.storer.com.br/auth/"
+USUARIO = ""
+SENHA = ""
+EMPRESA_BASE = ""
+EMPRESA_FORM = ""
+
+MENSAGENS_ERRO = [
+    "No colaborator found",
+    "Colaborador não encontrado",
+    "Colaborador não localizado",
+]
+MENSAGEM_SUCESSO = "Contrato cadastrado com sucesso."
+MENSAGEM_CARREGANDO = "Carregando dados do contrato"
+
+# ================= FUNÇÕES =================
+def formatar_data(valor):
+    if pd.isna(valor) or valor == "":
+        return ""
+    return pd.to_datetime(valor).strftime("%d/%m/%Y")
+
+def confirmar_autocomplete(page, valor):
+    page.keyboard.type(valor, delay=80)
+    page.wait_for_timeout(400)
+    page.keyboard.press("ArrowDown")
+    page.wait_for_timeout(200)
+    page.keyboard.press("Enter")
+    page.wait_for_timeout(500)
+
+def selecionar_base(page, nome_base):
+    campo_bases = page.locator("div.v-field:has(label:has-text('Bases')) input")
+    campo_bases.click()
+    confirmar_autocomplete(page, nome_base)
+    page.wait_for_selector(f"div.v-card-title:has-text('{nome_base}')", timeout=10000)
+    page.locator(f"div.v-card:has(div.v-card-title:has-text('{nome_base}')) button:has-text('Selecionar')").click()
+    page.wait_for_timeout(4000)
+
+def preencher_campo_via_tab(page, valor, tabs_antes=1):
+    for _ in range(tabs_antes):
+        page.keyboard.press("Tab")
+        page.wait_for_timeout(200)
+    confirmar_autocomplete(page, valor)
+
+def esperar_carregamento_contrato(page):
+    try:
+        page.wait_for_selector(f"text={MENSAGEM_CARREGANDO}", timeout=5000)
+    except:
+        return
+    try:
+        page.wait_for_selector(f"text={MENSAGEM_CARREGANDO}", state="detached", timeout=30000)
+    except:
+        pass
+
+def abrir_nova_contratacao(page, primeira_vez=False):
+    page.evaluate("window.scrollTo(0, 0)")
+    page.wait_for_timeout(500)
+    if primeira_vez:
+        page.locator("button[aria-haspopup='menu']").first.click()
+        page.wait_for_timeout(800)
+        page.locator("div.v-list-item-title:has-text('Contratar')").click()
+        page.wait_for_timeout(500)
+        page.locator("div.v-list-item-title:has-text('Contratos')").click()
+        page.wait_for_timeout(800)
+    try:
+        page.locator("span.v-btn__content:has-text('Nova Contratação')").click(timeout=3000)
+    except:
+        page.click("span.v-btn__content:has-text('Home')")
+        page.wait_for_timeout(1000)
+        page.evaluate("window.scrollTo(0, 0)")
+        page.wait_for_timeout(500)
+        page.locator("span.v-btn__content:has-text('Nova Contratação')").click()
+    esperar_carregamento_contrato(page)
+    page.wait_for_timeout(1000)
+
+def verificar_resultado(page):
+    try:
+        page.wait_for_selector(f"text={MENSAGEM_SUCESSO}", timeout=5000)
+        return "OK", MENSAGEM_SUCESSO
+    except:
+        pass
+    for msg in MENSAGENS_ERRO:
+        try:
+            page.wait_for_selector(f"text={msg}", timeout=2000)
+            return "ERRO", msg
+        except:
+            continue
+    return "ERRO", "Erro desconhecido ao cadastrar contrato"
+
+def cancelar_contratacao(page):
+    try:
+        page.locator("button:has-text('cancelar')").click(timeout=3000)
+        page.wait_for_timeout(2000)
+    except:
+        pass
+
+# ================= PLANILHA =================
+df = pd.read_excel(ARQUIVO)
+for col in ["STATUS", "ERRO"]:
+    if col not in df.columns:
+        df[col] = ""
+    df[col] = df[col].astype(str)
+
+# ================= PLAYWRIGHT =================
+with sync_playwright() as p:
+    browser = p.chromium.launch(headless=False)
+    page = browser.new_page()
+
+    page.goto(URL_LOGIN)
+    page.fill("#input-0", USUARIO)
+    page.fill("#input-2", SENHA)
+    page.click("button:has-text('Login')")
+    page.wait_for_timeout(4000)
+
+    selecionar_base(page, EMPRESA_BASE)
+
+    primeira_vez = True
+    for index, row in df.iterrows():
+        if str(row["STATUS"]).strip().upper() == "OK":
+            continue
+        try:
+            abrir_nova_contratacao(page, primeira_vez)
+            primeira_vez = False
+
+            campo_colaborador = page.locator("div.v-field:has(label:has-text('Colaborador')) input")
+            campo_colaborador.click()
+            confirmar_autocomplete(page, str(row["CPF"]))
+
+            page.locator("div.v-field:has(label:has-text('Matrícula')) input").fill(str(row["MATRICULA"]))
+            page.locator("div.v-field:has(label:has-text('Data de Admissão')) input").fill(formatar_data(row["DT ADMISSAO"]))
+            page.wait_for_timeout(500)
+
+            preencher_campo_via_tab(page, EMPRESA_FORM, tabs_antes=4)
+            preencher_campo_via_tab(page, str(row["DEPARTAMENTO"]), tabs_antes=2)
+            preencher_campo_via_tab(page, str(row["FUNCAO"]), tabs_antes=1)
+
+            page.click("button:has-text('Cadastrar Contrato')")
+            status, mensagem = verificar_resultado(page)
+            df.at[index, "STATUS"] = status
+            df.at[index, "ERRO"] = "" if status == "OK" else mensagem
+
+            if status == "OK":
+                print(f"✅ Linha {index + 2} cadastrada com sucesso")
+            else:
+                print(f"❌ Linha {index + 2} erro: {mensagem}")
+                cancelar_contratacao(page)
+
+        except Exception as e:
+            df.at[index, "STATUS"] = "ERRO"
+            df.at[index, "ERRO"] = str(e)
+            cancelar_contratacao(page)
+            print(f"❌ Erro linha {index + 2}: {e}")
+
+        df.to_excel(ARQUIVO, index=False)
+
+    browser.close()
+
+print("\n✅ Processo finalizado!")
