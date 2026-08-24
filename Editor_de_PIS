@@ -1,0 +1,187 @@
+import pandas as pd
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+# ================= CONFIGURAÇÕES =================
+ARQUIVO = "pis_funcionarios.xlsx"
+URL_LOGIN = "https://hcm.storer.com.br/auth/"
+EMPRESA_BASE = ""
+MSG_SUCESSO = "Funcionário atualizado com sucesso!"
+MENSAGENS_NAO_ENCONTRADO = [
+    "Nenhum registro encontrado",
+    "Nenhum resultado encontrado",
+    "Nenhum colaborador encontrado",
+    "No collaborator found",
+    "Colaborador não encontrado",
+    "Colaborador não localizado",
+]
+
+# ================= FUNÇÕES =================
+def limpar_texto(x):
+    return "" if x is None else str(x).strip()
+
+def formatar_pis_como_texto(pis):
+    s = limpar_texto(pis)
+    if s == "":
+        return ""
+    if s.endswith(".0") and s.replace(".", "", 1).isdigit():
+        s = s[:-2]
+    if ("e+" in s.lower() or "e" in s.lower()) and any(ch.isdigit() for ch in s):
+        try:
+            n = int(float(s))
+            s = str(n)
+        except:
+            pass
+    return s
+
+def confirmar_autocomplete(page, valor):
+    page.keyboard.type(valor, delay=60)
+    page.wait_for_timeout(250)
+    page.keyboard.press("ArrowDown")
+    page.wait_for_timeout(150)
+    page.keyboard.press("Enter")
+    page.wait_for_timeout(400)
+
+def selecionar_base(page, nome_base):
+    campo_bases = page.locator("div.v-field:has(label:has-text('Bases')) input")
+    campo_bases.click()
+    confirmar_autocomplete(page, nome_base)
+    page.wait_for_selector(f"div.v-card-title:has-text('{nome_base}')", timeout=15000)
+    page.locator(
+        f"div.v-card:has(div.v-card-title:has-text('{nome_base}')) "
+        "button:has-text('Selecionar')"
+    ).click()
+    page.wait_for_timeout(2500)
+
+def abrir_menu_contratar_funcionarios(page, primeira_vez):
+    if not primeira_vez:
+        return
+    page.evaluate("window.scrollTo(0, 0)")
+    page.wait_for_timeout(500)
+    page.locator("button[aria-haspopup='menu']").first.click()
+    page.wait_for_timeout(800)
+    page.locator("div.v-list-item-title:has-text('Contratar')").click()
+    page.wait_for_timeout(400)
+    page.locator("div.v-list-item-title:has-text('Funcionários')").click()
+    page.wait_for_timeout(1200)
+
+def aceitar_cookies_se_existir(page):
+    try:
+        btn = page.locator('button[data-cy="cookie-accept"]').first
+        if btn.count() > 0 and btn.is_visible():
+            btn.click(force=True)
+            page.wait_for_timeout(500)
+    except:
+        pass
+
+def filtrar_por_nome(page, nome):
+    campo_busca = page.locator("div.v-field:has(label:has-text('Nome/CPF/PIS')) input").first
+    campo_busca.click()
+    campo_busca.fill("")
+    page.keyboard.type(nome, delay=40)
+    page.keyboard.press("Enter")
+    page.wait_for_timeout(900)
+    try:
+        page.locator("button:has-text('Filtrar')").first.click(timeout=1500)
+        page.wait_for_timeout(900)
+    except:
+        pass
+
+def existe_mensagem(page, textos, timeout_ms=1200):
+    for t in textos:
+        try:
+            page.wait_for_selector(f"text={t}", timeout=timeout_ms)
+            return t
+        except:
+            continue
+    return None
+
+def abrir_edicao_primeiro_resultado(page):
+    icone = page.locator("i.mdi-pencil[role='button']").first
+    icone.wait_for(state="visible", timeout=8000)
+    icone.click()
+    page.wait_for_timeout(900)
+
+def atualizar_pis(page, pis_novo):
+    campo_pis = page.locator("div.v-field:has(label:has-text('PIS')) input").first
+    campo_pis.wait_for(state="visible", timeout=10000)
+    campo_pis.click()
+    campo_pis.fill("")
+    page.keyboard.type(pis_novo, delay=35)
+    page.locator("button:has-text('Atualizar')").first.click()
+    page.wait_for_timeout(900)
+    try:
+        page.wait_for_selector(f"text={MSG_SUCESSO}", timeout=8000)
+        return True, MSG_SUCESSO
+    except:
+        msg_nf = existe_mensagem(page, MENSAGENS_NAO_ENCONTRADO, timeout_ms=800)
+        if msg_nf:
+            return False, msg_nf
+        return False, "Não consegui confirmar a mensagem de sucesso."
+
+# ================= PLANILHA =================
+df = pd.read_excel(ARQUIVO, dtype=str)
+if "NOME" not in df.columns or "PIS" not in df.columns:
+    cols = list(df.columns)
+    if len(cols) < 2:
+        raise ValueError("A planilha precisa ter pelo menos 2 colunas: NOME e PIS.")
+    df = df.rename(columns={cols[0]: "NOME", cols[1]: "PIS"})
+
+for col in ["STATUS", "ERRO"]:
+    if col not in df.columns:
+        df[col] = ""
+    df[col] = df[col].astype(str)
+
+# ================= PLAYWRIGHT =================
+with sync_playwright() as p:
+    browser = p.chromium.launch(headless=False)
+    page = browser.new_page()
+    page.goto(URL_LOGIN, wait_until="domcontentloaded")
+    aceitar_cookies_se_existir(page)
+    print("🟡 Faça o login manualmente no navegador aberto.")
+    print("🟡 Vou aguardar aparecer o seletor de Bases para continuar...")
+    page.wait_for_selector("div.v-field:has(label:has-text('Bases')) input", timeout=10 * 60 * 1000)
+    print("✅ Detectei a tela de seleção de base. Continuando...")
+    selecionar_base(page, EMPRESA_BASE)
+
+    primeira_vez_menu = True
+    for index, row in df.iterrows():
+        if str(row["STATUS"]).strip().upper() == "OK":
+            continue
+        nome = limpar_texto(row.get("NOME", ""))
+        pis = formatar_pis_como_texto(row.get("PIS", ""))
+        if nome == "" or pis == "":
+            df.at[index, "STATUS"] = "ERRO"
+            df.at[index, "ERRO"] = "NOME ou PIS vazio na planilha"
+            df.to_excel(ARQUIVO, index=False)
+            print(f"❌ Linha {index + 2}: NOME/PIS vazio")
+            continue
+        try:
+            abrir_menu_contratar_funcionarios(page, primeira_vez_menu)
+            primeira_vez_menu = False
+            filtrar_por_nome(page, nome)
+            msg_nf = existe_mensagem(page, MENSAGENS_NAO_ENCONTRADO, timeout_ms=1200)
+            if msg_nf:
+                df.at[index, "STATUS"] = "ERRO"
+                df.at[index, "ERRO"] = msg_nf
+                df.to_excel(ARQUIVO, index=False)
+                print(f"❌ Linha {index + 2}: {nome} -> {msg_nf}")
+                continue
+            abrir_edicao_primeiro_resultado(page)
+            ok, msg = atualizar_pis(page, pis)
+            df.at[index, "STATUS"] = "OK" if ok else "ERRO"
+            df.at[index, "ERRO"] = "" if ok else msg
+            if ok:
+                print(f"✅ Linha {index + 2}: {nome} -> PIS atualizado para {pis}")
+            else:
+                print(f"❌ Linha {index + 2}: {nome} -> {msg}")
+        except PWTimeout as e:
+            df.at[index, "STATUS"] = "ERRO"
+            df.at[index, "ERRO"] = f"Timeout: {str(e)}"
+            print(f"❌ Linha {index + 2}: Timeout: {e}")
+        except Exception as e:
+            df.at[index, "STATUS"] = "ERRO"
+            df.at[index, "ERRO"] = str(e)
+            print(f"❌ Linha {index + 2}: {e}")
+        df.to_excel(ARQUIVO, index=False)
+    browser.close()
+    print("🏁 Finalizado.")
