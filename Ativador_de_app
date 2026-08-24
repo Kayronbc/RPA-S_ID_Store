@@ -1,0 +1,214 @@
+import pandas as pd
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+# ================= CONFIG =================
+ARQUIVO = "ativar_login.xlsx"
+URL_LOGIN = "https://hcm.storer.com.br/auth/"
+EMPRESA_BASE = ""
+
+MENSAGENS_NAO_ENCONTRADO = [
+    "Nenhum registro encontrado",
+    "Nenhum colaborador encontrado",
+    "No collaborator found",
+    "Colaborador não encontrado",
+    "Colaborador não localizado",
+]
+
+MSG_SUCESSO = "Contrato atualizado com sucesso!"
+
+# ================= FUNÇÕES =================
+def limpar(x):
+    return "" if x is None else str(x).strip()
+
+
+def confirmar_autocomplete(page, valor):
+    page.keyboard.type(valor, delay=80)
+    page.wait_for_timeout(300)
+    page.keyboard.press("ArrowDown")
+    page.wait_for_timeout(200)
+    page.keyboard.press("Enter")
+    page.wait_for_timeout(500)
+
+
+def selecionar_base(page, nome_base):
+    campo = page.locator("div.v-field:has(label:has-text('Bases')) input")
+    campo.click()
+    confirmar_autocomplete(page, nome_base)
+
+    page.wait_for_selector(f"div.v-card-title:has-text('{nome_base}')")
+    page.locator(
+        f"div.v-card:has(div.v-card-title:has-text('{nome_base}')) button:has-text('Selecionar')"
+    ).click()
+
+    page.wait_for_timeout(3000)
+
+
+def abrir_menu_contratos(page, primeira_vez):
+    if not primeira_vez:
+        return
+
+    page.evaluate("window.scrollTo(0,0)")
+    page.wait_for_timeout(500)
+
+    page.locator("button[aria-haspopup='menu']").first.click()
+    page.wait_for_timeout(800)
+
+    page.locator("div.v-list-item-title:has-text('Contratar')").click()
+    page.wait_for_timeout(400)
+
+    page.locator("div.v-list-item-title:has-text('Contratos')").click()
+    page.wait_for_timeout(1500)
+
+
+def filtrar_por_nome(page, nome):
+    campo = page.locator("div.v-field:has(label:has-text('Nome/Função/PIS')) input").first
+    campo.click()
+    campo.fill("")
+    page.keyboard.type(nome, delay=40)
+
+    page.keyboard.press("Enter")
+    page.wait_for_timeout(800)
+
+    try:
+        page.locator("button:has-text('Filtrar')").click(timeout=1500)
+        page.wait_for_timeout(800)
+    except:
+        pass
+
+
+def existe_mensagem(page, textos):
+    for t in textos:
+        try:
+            page.wait_for_selector(f"text={t}", timeout=1200)
+            return t
+        except:
+            continue
+    return None
+
+
+def abrir_edicao(page):
+    icone = page.locator("i.mdi-pencil[role='button']").first
+    icone.wait_for(state="visible", timeout=8000)
+    icone.click()
+    page.wait_for_timeout(1200)
+
+
+def ir_para_aba_aplicativo(page):
+    aba = page.locator("span.v-btn__content:has-text('Aplicativo')")
+    aba.wait_for(state="visible", timeout=8000)
+    aba.click()
+    page.wait_for_timeout(800)
+
+
+def marcar_flags_via_tab(page):
+    # sequência que você definiu
+    page.keyboard.press("Tab")
+    page.keyboard.press("Space")
+    page.wait_for_timeout(200)
+
+    for _ in range(3):
+        page.keyboard.press("Tab")
+        page.wait_for_timeout(150)
+
+    page.keyboard.press("Space")
+    page.wait_for_timeout(200)
+
+    page.keyboard.press("Tab")
+    page.keyboard.press("Space")
+    page.wait_for_timeout(200)
+
+    page.keyboard.press("Tab")
+    page.keyboard.press("Space")
+    page.wait_for_timeout(200)
+
+
+def atualizar_contrato(page):
+    page.locator("button:has-text('Atualizar Contrato')").click()
+
+    try:
+        page.wait_for_selector(f"text={MSG_SUCESSO}", timeout=8000)
+        return True, MSG_SUCESSO
+    except:
+        return False, "Não confirmou sucesso ao atualizar"
+
+
+# ================= PLANILHA =================
+df = pd.read_excel(ARQUIVO, dtype=str)
+
+if "NOME" not in df.columns:
+    raise ValueError("Planilha precisa ter coluna NOME")
+
+for col in ["STATUS", "ERRO"]:
+    if col not in df.columns:
+        df[col] = ""
+    df[col] = df[col].astype(str)
+
+# ================= PLAYWRIGHT =================
+with sync_playwright() as p:
+    browser = p.chromium.launch(headless=False)
+    page = browser.new_page()
+
+    # LOGIN MANUAL
+    page.goto(URL_LOGIN)
+    print("🟡 Faça login manual...")
+    page.wait_for_selector("div.v-field:has(label:has-text('Bases')) input", timeout=600000)
+
+    selecionar_base(page, EMPRESA_BASE)
+
+    primeira_vez = True
+
+    for index, row in df.iterrows():
+
+        if limpar(row["STATUS"]).upper() == "OK":
+            continue
+
+        nome = limpar(row["NOME"])
+
+        if nome == "":
+            df.at[index, "STATUS"] = "ERRO"
+            df.at[index, "ERRO"] = "Nome vazio"
+            continue
+
+        try:
+            abrir_menu_contratos(page, primeira_vez)
+            primeira_vez = False
+
+            # PESQUISA
+            filtrar_por_nome(page, nome)
+
+            msg = existe_mensagem(page, MENSAGENS_NAO_ENCONTRADO)
+            if msg:
+                df.at[index, "STATUS"] = "ERRO"
+                df.at[index, "ERRO"] = msg
+                print(f"❌ {nome} não encontrado")
+                continue
+
+            # EDITAR
+            abrir_edicao(page)
+
+            # ABA APLICATIVO
+            ir_para_aba_aplicativo(page)
+
+            # FLAGS
+            marcar_flags_via_tab(page)
+
+            # SALVAR
+            ok, mensagem = atualizar_contrato(page)
+
+            df.at[index, "STATUS"] = "OK" if ok else "ERRO"
+            df.at[index, "ERRO"] = "" if ok else mensagem
+
+            if ok:
+                print(f"✅ {nome} atualizado")
+            else:
+                print(f"❌ {nome}: {mensagem}")
+
+        except Exception as e:
+            df.at[index, "STATUS"] = "ERRO"
+            df.at[index, "ERRO"] = str(e)
+            print(f"❌ Erro {nome}: {e}")
+
+        df.to_excel(ARQUIVO, index=False)
+
+    browser.close()
+    print("🏁 Finalizado.")
