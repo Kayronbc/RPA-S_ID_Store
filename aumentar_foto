@@ -1,0 +1,99 @@
+import os
+from pathlib import Path
+from PIL import Image
+
+# ================= CONFIGURAÇÕES =================
+PASTA_ORIGEM = Path(r"C:\Users\victor\Pictures\Fotos pra aumentar")
+PASTA_DESTINO = Path(r"C:\Users\victor\Pictures\Fotos Aumentadas")
+
+TAMANHO_MIN_KB = 60
+QUALIDADE_JPEG = 95
+FATOR_INICIAL = 2
+FATOR_MAXIMO = 6
+
+EXTENSOES_ACEITAS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+# cria pasta de saída
+PASTA_DESTINO.mkdir(parents=True, exist_ok=True)
+
+
+# ================= FUNÇÕES =================
+def tamanho_kb(caminho: Path) -> float:
+    return caminho.stat().st_size / 1024
+
+
+def garantir_rgb(img: Image.Image) -> Image.Image:
+    if img.mode in ("RGBA", "P", "LA"):
+        fundo = Image.new("RGB", img.size, (255, 255, 255))
+        if img.mode == "P":
+            img = img.convert("RGBA")
+        fundo.paste(img, mask=img.split()[-1] if "A" in img.mode else None)
+        return fundo
+    if img.mode != "RGB":
+        return img.convert("RGB")
+    return img
+
+
+def processar_imagem(caminho_origem: Path, caminho_destino: Path) -> tuple[str, float]:
+    """
+    Retorna:
+    - status
+    - tamanho final em KB
+    """
+    tamanho_original = tamanho_kb(caminho_origem)
+
+    with Image.open(caminho_origem) as img_original:
+        img_base = garantir_rgb(img_original)
+
+        # se já estiver acima do mínimo, apenas salva em JPG com qualidade alta
+        if tamanho_original >= TAMANHO_MIN_KB:
+            destino_final = caminho_destino.with_suffix(".jpg")
+            img_base.save(destino_final, format="JPEG", quality=QUALIDADE_JPEG)
+            return "JÁ ESTAVA OK", tamanho_kb(destino_final)
+
+        fator = FATOR_INICIAL
+        melhor_destino = caminho_destino.with_suffix(".jpg")
+
+        while fator <= FATOR_MAXIMO:
+            nova_largura = int(img_base.width * fator)
+            nova_altura = int(img_base.height * fator)
+
+            img_redimensionada = img_base.resize((nova_largura, nova_altura), Image.LANCZOS)
+            img_redimensionada.save(melhor_destino, format="JPEG", quality=QUALIDADE_JPEG)
+
+            tamanho_final = tamanho_kb(melhor_destino)
+            if tamanho_final >= TAMANHO_MIN_KB:
+                return f"AUMENTADA {fator}x", tamanho_final
+
+            fator += 1
+
+        return "AUMENTADA NO LIMITE", tamanho_kb(melhor_destino)
+
+
+# ================= EXECUÇÃO =================
+def main():
+    arquivos = [p for p in PASTA_ORIGEM.iterdir() if p.is_file() and p.suffix.lower() in EXTENSOES_ACEITAS]
+
+    if not arquivos:
+        print("Nenhuma imagem encontrada na pasta.")
+        return
+
+    print(f"Total de imagens encontradas: {len(arquivos)}")
+    print("-" * 60)
+
+    for arquivo in arquivos:
+        try:
+            destino_base = PASTA_DESTINO / arquivo.stem
+            status, tamanho_final = processar_imagem(arquivo, destino_base)
+
+            print(f"OK -> {arquivo.name} | {status} | {tamanho_final:.2f} KB")
+
+        except Exception as e:
+            print(f"ERRO -> {arquivo.name} | {e}")
+
+    print("-" * 60)
+    print("Finalizado.")
+
+
+if __name__ == "__main__":
+    main()
