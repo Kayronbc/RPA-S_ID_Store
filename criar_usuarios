@@ -1,0 +1,193 @@
+import pandas as pd
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+print(">>> SCRIPT INICIADO <<<")
+
+# ================= CONFIGURAÇÕES =================
+ARQUIVO = "usuarios.xlsx"
+URL_LOGIN = "https://hcm.storer.com.br/auth/"
+EMPRESA_BASE = ""
+
+MSG_SUCESSO = "Usuário cadastrado com sucesso!"
+
+# ================= FUNÇÕES =================
+def limpar(x):
+    return "" if x is None else str(x).strip()
+
+
+def confirmar_autocomplete(page, valor):
+    page.keyboard.type(valor, delay=80)
+    page.wait_for_timeout(400)
+    page.keyboard.press("ArrowDown")
+    page.wait_for_timeout(200)
+    page.keyboard.press("Enter")
+    page.wait_for_timeout(500)
+
+
+def selecionar_base(page, nome_base):
+    campo_bases = page.locator("div.v-field:has(label:has-text('Bases')) input")
+    campo_bases.click()
+    confirmar_autocomplete(page, nome_base)
+
+    page.wait_for_selector(f"div.v-card-title:has-text('{nome_base}')", timeout=10000)
+
+    page.locator(
+        f"div.v-card:has(div.v-card-title:has-text('{nome_base}')) "
+        "button:has-text('Selecionar')"
+    ).click()
+
+    page.wait_for_timeout(4000)
+
+
+def abrir_menu(page):
+    page.evaluate("window.scrollTo(0, 0)")
+    page.wait_for_timeout(500)
+    page.locator("button[aria-haspopup='menu']").first.click()
+    page.wait_for_timeout(800)
+
+
+def abrir_usuarios_da_base(page):
+    page.locator("div.v-list-item-title:has-text('Gerenciar')").click()
+    page.wait_for_timeout(600)
+    page.locator("div.v-list-item-title:has-text('Usuários da Base')").click()
+    page.wait_for_timeout(2000)
+
+
+def novo_usuario(page):
+    page.locator("button:has-text('Novo Usuário')").wait_for(state="visible", timeout=10000)
+    page.locator("button:has-text('Novo Usuário')").click()
+    page.wait_for_timeout(1500)
+
+
+def selecionar_perfis(page, perfis):
+    campo_perfil = page.locator("div.v-field:has(label:has-text('Perfil'))")
+    campo_perfil.click()
+    page.wait_for_timeout(500)
+
+    for perfil in perfis:
+        page.keyboard.press("ArrowDown")
+        page.wait_for_timeout(400)
+
+        item = page.locator(
+            "div.v-overlay div.v-list-item-title",
+            has_text=perfil
+        ).first
+
+        item.wait_for(state="visible", timeout=5000)
+        item.click()
+
+        page.wait_for_timeout(400)
+
+
+def preencher_usuario(page, dados):
+    # CPF
+    campo_cpf = page.locator("div.v-field:has(label:has-text('CPF')) input").first
+    campo_cpf.click()
+    campo_cpf.fill("")
+    page.keyboard.type(dados["CPF"], delay=60)
+
+    # LOGIN
+    page.keyboard.press("Tab")
+    page.wait_for_timeout(300)
+    page.keyboard.type(dados["LOGIN"], delay=60)
+
+    # EMAIL
+    page.keyboard.press("Tab")
+    page.wait_for_timeout(300)
+    page.keyboard.type(dados["EMAIL"], delay=60)
+
+    page.wait_for_timeout(500)
+
+    # PERFIS
+    selecionar_perfis(page, ["Usuário", "Aplicativo"])
+
+    # ===== SALVAR VIA TAB =====
+    page.wait_for_timeout(800)
+
+    for _ in range(4):
+        page.keyboard.press("Tab")
+        page.wait_for_timeout(200)
+
+    page.keyboard.press("Enter")
+
+    # Confirma sucesso
+    page.wait_for_selector(f"text={MSG_SUCESSO}", timeout=10000)
+
+    # Aguarda voltar
+    page.locator("button:has-text('Novo Usuário')").wait_for(state="visible", timeout=10000)
+
+
+# ================= PLANILHA =================
+df = pd.read_excel(ARQUIVO, dtype=str)
+
+# Validação de colunas
+for col in ["CPF", "LOGIN", "E-MAIL"]:
+    if col not in df.columns:
+        raise ValueError(f"Coluna obrigatória não encontrada: {col}")
+
+for col in ["STATUS", "ERRO"]:
+    if col not in df.columns:
+        df[col] = ""
+    df[col] = df[col].astype(str)
+
+
+# ================= PLAYWRIGHT =================
+with sync_playwright() as p:
+    browser = p.chromium.launch(headless=False)
+    page = browser.new_page()
+
+    # LOGIN MANUAL (mais estável)
+    page.goto(URL_LOGIN)
+    print("🟡 Faça o login manualmente...")
+
+    page.wait_for_selector("div.v-field:has(label:has-text('Bases')) input", timeout=600000)
+
+    selecionar_base(page, EMPRESA_BASE)
+
+    abrir_menu(page)
+    abrir_usuarios_da_base(page)
+
+    for index, row in df.iterrows():
+
+        if limpar(row["STATUS"]).upper() == "OK":
+            continue
+
+        cpf = limpar(row["CPF"])
+        login = limpar(row["LOGIN"])
+        email = limpar(row["E-MAIL"])
+
+        if cpf == "" or login == "" or email == "":
+            df.at[index, "STATUS"] = "ERRO"
+            df.at[index, "ERRO"] = "CPF/LOGIN/EMAIL vazio"
+            df.to_excel(ARQUIVO, index=False)
+            print(f"❌ Linha {index + 2}: dados vazios")
+            continue
+
+        try:
+            novo_usuario(page)
+
+            preencher_usuario(page, {
+                "CPF": cpf,
+                "LOGIN": login,
+                "EMAIL": email,
+            })
+
+            df.at[index, "STATUS"] = "OK"
+            df.at[index, "ERRO"] = ""
+
+            print(f"✅ Linha {index + 2}: usuário criado")
+
+        except PWTimeout as e:
+            df.at[index, "STATUS"] = "ERRO"
+            df.at[index, "ERRO"] = f"Timeout: {str(e)}"
+            print(f"❌ Linha {index + 2}: Timeout")
+
+        except Exception as e:
+            df.at[index, "STATUS"] = "ERRO"
+            df.at[index, "ERRO"] = str(e)
+            print(f"❌ Linha {index + 2}: {e}")
+
+        df.to_excel(ARQUIVO, index=False)
+
+    browser.close()
+    print("🏁 Finalizado.")
