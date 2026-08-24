@@ -1,0 +1,184 @@
+import pandas as pd
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+
+# ================= CONFIG =================
+ARQUIVO = "visitas.xlsx"
+URL_LOGIN = "https://hcm.storer.com.br/auth/"
+USUARIO = ""
+SENHA = ""
+EMPRESA_BASE = ""
+
+# ================= FUNÇÕES =================
+
+def aceitar_cookies(page):
+    try:
+        botao = page.locator("button[data-cy='cookie-accept']")
+        if botao.is_visible(timeout=5000):
+            botao.click()
+            page.wait_for_timeout(2000)
+            print("🍪 Cookies aceitos")
+    except:
+        pass
+
+def login_via_tab(page):
+    page.wait_for_timeout(3000)
+    page.keyboard.press("Tab")
+    page.keyboard.type(USUARIO)
+    page.keyboard.press("Tab")
+    page.keyboard.type(SENHA)
+    page.keyboard.press("Tab")
+    page.keyboard.press("Tab")
+    page.keyboard.press("Tab")
+    page.keyboard.press("Enter")
+    page.wait_for_timeout(5000)
+
+def selecionar_base(page):
+    campo = page.locator("div.v-field:has(label:has-text('Bases')) input")
+    campo.click()
+    page.keyboard.type(EMPRESA_BASE)
+    page.keyboard.press("ArrowDown")
+    page.keyboard.press("Enter")
+    page.wait_for_selector(f"text={EMPRESA_BASE}")
+    page.locator("button:has-text('Selecionar')").click()
+    page.wait_for_timeout(4000)
+
+def abrir_menu_visitantes(page, primeira_vez):
+    if primeira_vez:
+        page.locator("button[aria-haspopup='menu']").first.click()
+        page.wait_for_timeout(1000)
+        page.locator("div.v-list-item-title:has-text('Controle de Acesso')").click()
+        page.wait_for_timeout(500)
+        page.locator("div.v-list-item-title:has-text('Visitantes')").click()
+        page.wait_for_timeout(1500)
+
+    page.locator("button:has-text('Novo Visitante')").click()
+    page.wait_for_timeout(2000)
+    page.locator("button:has-text('Dados do Visitante')").click()
+    page.wait_for_timeout(1000)
+
+def preencher_visitante(page, row):
+    page.fill("div.v-field:has(label:has-text('CPF')) input", str(row["CPF"]))
+    page.fill("div.v-field:has(label:has-text('Nome')) input", str(row["NOME"]))
+
+    empresa = "" if pd.isna(row["EMPRESA"]) else str(row["EMPRESA"])
+    if empresa.strip() == "":
+        empresa = " "
+    empresa_input = page.locator("label:has-text('Empresa')").locator("xpath=ancestor::div[contains(@class,'v-field')]").locator("input")
+    empresa_input.click()
+    page.keyboard.press("Control+A")
+    page.keyboard.type(empresa)
+
+def preencher_demais_campos_e_salvar(page, row):
+    page.keyboard.press("Tab")
+    page.keyboard.press("Tab")
+    page.keyboard.type(str(row.get("CAMPO_D", "")))
+    page.keyboard.press("Enter")
+    page.locator("button:has-text('Salvar')").first.click()
+    page.wait_for_timeout(2000)
+
+def criar_acesso(page, row):
+    try:
+        page.locator("button:has-text('Confirmar')").wait_for(timeout=5000)
+        page.locator("button:has-text('Confirmar')").click()
+    except PlaywrightTimeoutError:
+        print("❌ Botão 'Confirmar' não apareceu, marcando linha como ERRO")
+        row["status"] = "ERRO"
+        return False
+
+    page.wait_for_timeout(1000)
+
+    page.keyboard.press("Tab")
+    page.keyboard.press("Tab")
+    page.keyboard.press("Tab")
+    page.keyboard.press("Space")
+    page.keyboard.press("Tab")
+    page.keyboard.press("ArrowDown")
+
+    page.locator("button.v-date-picker-month__day-btn", has_text="1").first.click()
+    page.wait_for_timeout(1500)
+
+    for _ in range(12):
+        page.locator("button[data-testid='next-month']").click()
+        page.wait_for_timeout(100)
+
+    page.locator("button.v-date-picker-month__day-btn", has_text="1").nth(1).click()
+    page.wait_for_timeout(1500)
+
+    page.keyboard.press("Escape")
+    page.wait_for_timeout(1500)
+
+    responsavel = page.locator("div.v-field:has(label:has-text('Responsável pela visita')) input")
+    responsavel.click()
+    responsavel.fill("JOAO CLEBER TIMOTEO DO NASCIMENTO NUGOLI")
+    page.keyboard.press("ArrowDown")
+    page.keyboard.press("Enter")
+    page.wait_for_timeout(1500)
+
+    finalidade = page.locator("div.v-field:has(label:has-text('Finalidade da visita')) input")
+    finalidade.click()
+    finalidade.fill(str(row.get("CAMPO_D", "")))
+    page.wait_for_timeout(1500)
+
+    acessos_lista = ["ACESSO 1", "ACESSO 2"]
+
+    for acesso_nome in acessos_lista:
+        catraca = page.locator("div.v-field:has(label:has-text('Catraca')) input")
+        catraca.click()
+        catraca.fill(acesso_nome)
+        page.keyboard.press("ArrowDown")
+        page.keyboard.press("Enter")
+        page.wait_for_timeout(1500)
+
+        acessos = page.locator("div.v-field:has(label:has-text('Acessos')) input")
+        acessos.click()
+        page.wait_for_timeout(500)
+        page.keyboard.press("Control+A")
+        page.keyboard.type("260")
+        page.wait_for_timeout(500)
+        page.keyboard.press("Enter")
+        page.wait_for_timeout(500)
+
+        page.keyboard.press("Tab")
+        page.keyboard.press("Enter")
+        page.wait_for_timeout(1500)
+
+    page.locator("button:has-text('Salvar')").click()
+    page.wait_for_timeout(1500)
+    row["status"] = "OK"
+
+# ================= EXECUÇÃO =================
+
+df = pd.read_excel(ARQUIVO)
+
+with sync_playwright() as p:
+    browser = p.chromium.launch(headless=False)
+    page = browser.new_page()
+    page.goto(URL_LOGIN)
+
+    aceitar_cookies(page)
+    login_via_tab(page)
+    selecionar_base(page)
+
+    primeira_vez = True
+
+    for index, row in df.iterrows():
+        try:
+            abrir_menu_visitantes(page, primeira_vez)
+            primeira_vez = False
+
+            preencher_visitante(page, row)
+            preencher_demais_campos_e_salvar(page, row)
+
+            sucesso = criar_acesso(page, row)
+            if sucesso is False:
+                print(f"⚠️ Linha {index+2} pulada por erro no botão Confirmar")
+                continue
+
+            print(f"✅ Linha {index+2} visitante e acesso criados com sucesso")
+
+        except Exception as e:
+            print(f"❌ Erro linha {index+2}: {e}")
+            row["status"] = "ERRO"
+
+    df.to_excel(ARQUIVO, index=False)
+    browser.close()
