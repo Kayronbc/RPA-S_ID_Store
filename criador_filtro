@@ -1,0 +1,297 @@
+from playwright.sync_api import sync_playwright
+import pandas as pd
+import time
+import os
+import re
+
+URL = "https://cloud17.sisponto.com.br/idstore/open.do?action=open&sys=SPW"
+USUARIO = ""
+SENHA = ""
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ARQUIVO_EXCEL = os.path.join(BASE_DIR, "dados.xlsx")
+ABA_EXCEL = "BASE"
+
+DELAY = 1500
+PAUSA_LOCALIZAR_MS = 1500
+PAUSA_APOS_FILTRAR_MS = 1500
+WAIT_RESULTADOS_MS = 6500
+POLL_MS = 300
+
+def esperar(ms=DELAY):
+    time.sleep(ms / 1000)
+
+def carregar_base():
+    print("📄 Lendo planilha:", ARQUIVO_EXCEL)
+    if not os.path.exists(ARQUIVO_EXCEL):
+        raise Exception(f"Arquivo não encontrado: {ARQUIVO_EXCEL}")
+    df = pd.read_excel(ARQUIVO_EXCEL, sheet_name=ABA_EXCEL)
+    df.columns = [str(c).strip().upper() for c in df.columns]
+    if "ESCALA" not in df.columns or "NOME" not in df.columns:
+        raise Exception("A planilha precisa ter as colunas: ESCALA e NOME (aba BASE).")
+    df = df[["ESCALA", "NOME"]].dropna(subset=["ESCALA", "NOME"])
+    df["ESCALA"] = df["ESCALA"].astype(str).str.strip()
+    df["NOME"] = df["NOME"].astype(str).str.strip()
+    escalas_em_ordem = df["ESCALA"].drop_duplicates().tolist()
+    mapa = {}
+    for e in escalas_em_ordem:
+        mapa[e] = df.loc[df["ESCALA"] == e, "NOME"].dropna().tolist()
+    return escalas_em_ordem, mapa
+
+def encontrar_frame_com_texto(page, texto):
+    for frame in page.frames:
+        try:
+            if frame.locator(f"text={texto}").count() > 0:
+                return frame
+        except:
+            continue
+    return None
+
+def encontrar_frame_localizar_input(page, timeout=20000):
+    print("🔎 Procurando frame do input do Localizar (q$0)...")
+    fim = time.time() + timeout / 1000
+    while time.time() < fim:
+        for frame in page.frames:
+            try:
+                if frame.locator('input[name="q$0"]').count() > 0:
+                    print("✅ Frame do Localizar (q$0) encontrado!")
+                    return frame
+            except:
+                pass
+        page.wait_for_timeout(300)
+    raise Exception("❌ Não encontrei o frame do input q$0 (Localizar).")
+
+def encontrar_frame_grid_escalas(page, timeout=20000):
+    print("🔎 Procurando frame do grid de escalas...")
+    fim = time.time() + timeout / 1000
+    while time.time() < fim:
+        for frame in page.frames:
+            try:
+                if frame.locator("div.active-grid-row").count() > 0 and frame.locator("div.searchString").count() > 5:
+                    print("✅ Frame do grid de escalas encontrado!")
+                    return frame
+            except:
+                pass
+        page.wait_for_timeout(300)
+    raise Exception("❌ Não encontrei o frame do GRID de escalas.")
+
+def encontrar_frame_funcionarios(page, timeout=20000):
+    print("🔎 Procurando frame com campo de pesquisa (funcionários)...")
+    fim = time.time() + timeout / 1000
+    while time.time() < fim:
+        for frame in page.frames:
+            try:
+                if frame.locator("input[type='text']").count() > 0 and frame.locator('button:has-text("Filtrar")').count() > 0:
+                    print("✅ Frame de funcionários encontrado!")
+                    return frame
+            except:
+                pass
+        page.wait_for_timeout(300)
+    raise Exception("❌ Não encontrou frame com campo de pesquisa (funcionários).")
+
+def ativar_linha(row):
+    col_nome = row.locator("div.active-column-3")
+    col_zero = row.locator("div.active-column-0")
+    col_um = row.locator("div.active-column-1")
+    tentativas = [col_nome, col_zero, col_um]
+    for tentativa in tentativas:
+        try:
+            tentativa.scroll_into_view_if_needed()
+            esperar(400)
+            tentativa.click(click_count=2, delay=200, force=True)
+            esperar(1500)
+            if row.locator('div.active-column-0:has-text("Sim")').count() > 0:
+                return True
+        except:
+            pass
+    return False
+
+def abrir_localizar(frame_multi):
+    frame_multi.locator('span:has-text("Localizar")').click(force=True)
+
+def filtrar_escala_no_localizar(frame_loc, multi_page, nome_escala):
+    print("⌨️ Filtrando escala no Localizar (q$0)...")
+    campo = frame_loc.locator('input[name="q$0"]').first
+    campo.click(force=True)
+    multi_page.wait_for_timeout(PAUSA_LOCALIZAR_MS)
+    campo.fill("")
+    multi_page.wait_for_timeout(500)
+    campo.fill(nome_escala)
+    multi_page.wait_for_timeout(PAUSA_LOCALIZAR_MS)
+    campo.press("Enter")
+    multi_page.wait_for_timeout(PAUSA_LOCALIZAR_MS)
+
+def abrir_escala_no_grid(frame_grid, multi_page, nome_escala, timeout=45000):
+    print(f"📌 Abrindo escala no grid: {nome_escala}")
+    fim = time.time() + timeout / 1000
+    row = frame_grid.locator(
+        f'div.active-grid-row:has(div.searchString:has-text("{nome_escala}"))'
+    ).first
+    cell0 = row.locator('div.active-column-0 div.searchString').first
+    while time.time() < fim:
+        try:
+            if row.count() > 0:
+                row.wait_for(state="visible", timeout=3000)
+                row.scroll_into_view_if_needed()
+                time.sleep(0.5)
+                try:
+                    cell0.wait_for(state="visible", timeout=2000)
+                    cell0.click(force=True)
+                    time.sleep(0.3)
+                    cell0.dblclick(force=True)
+                    time.sleep(1.2)
+                    print("✅ Clique + duplo clique na coluna 0 executado.")
+                    return True
+                except:
+                    pass
+                try:
+                    row.click(force=True)
+                    time.sleep(0.3)
+                    row.dblclick(force=True)
+                    time.sleep(1.2)
+                    print("✅ Dblclick no row executado.")
+                    return True
+                except:
+                    pass
+                try:
+                    row.click(force=True)
+                    time.sleep(0.4)
+                    multi_page.keyboard.press("Enter")
+                    time.sleep(1.2)
+                    print("✅ Enter após selecionar a linha executado.")
+                    return True
+                except:
+                    pass
+        except:
+            pass
+        time.sleep(0.3)
+    raise Exception(f"❌ A escala apareceu no grid, mas não consegui abrir: {nome_escala}")
+
+def esperar_resultados_funcionario(frame_func, nome):
+    locator_nome = frame_func.locator(f'div.active-column-3 >> text=/{re.escape(nome)}/i')
+    fim = time.time() + (WAIT_RESULTADOS_MS / 1000)
+    ultimo_total = -1
+    estabilidade = 0
+    while time.time() < fim:
+        try:
+            total = locator_nome.count()
+        except:
+            total = 0
+        if total > 0:
+            return locator_nome, total
+        if total == ultimo_total:
+            estabilidade += 1
+        else:
+            estabilidade = 0
+            ultimo_total = total
+        time.sleep(POLL_MS / 1000)
+    return locator_nome, locator_nome.count()
+
+def processar_nomes_na_escala(frame_func, nomes):
+    campo = frame_func.locator("input[type='text']").first
+    btn_filtrar = frame_func.locator('button:has-text("Filtrar")').first
+    for nome in nomes:
+        nome = str(nome).strip()
+        if not nome:
+            continue
+        print(f"🔎 Processando funcionário: {nome}")
+        campo.click(force=True)
+        esperar(400)
+        campo.fill("")
+        esperar(500)
+        campo.fill(nome)
+        esperar(1500)
+        btn_filtrar.click(force=True)
+        esperar(PAUSA_APOS_FILTRAR_MS)
+        resultados, total = esperar_resultados_funcionario(frame_func, nome)
+        print(f"Encontrados: {total}")
+        for i in range(total):
+            try:
+                item = resultados.nth(i)
+                item.wait_for(state="visible", timeout=5000)
+                row = item.locator("..").locator("..")
+                sucesso = ativar_linha(row)
+                print("   ✅ Virou SIM" if sucesso else "   ⚠️ Falhou tentativa")
+                esperar(900)
+            except Exception as e:
+                print(f"   ⚠️ Erro ao tentar ativar linha ({i+1}/{total}): {e}")
+                esperar(900)
+        esperar(1200)
+
+def run():
+    escalas, mapa_nomes = carregar_base()
+    print(f"📄 Total de escalas na planilha: {len(escalas)}")
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=False)
+        context = browser.new_context()
+        page = context.new_page()
+        try:
+            print("🔵 Acessando site...")
+            page.goto(URL)
+            page.wait_for_load_state("networkidle")
+            page.wait_for_selector("iframe")
+            login_frame = page.frame_locator("iframe").first
+            login_frame.locator('input[placeholder="Usuário:"]').fill(USUARIO)
+            login_frame.locator('input[placeholder="Senha:"]').fill(SENHA)
+            login_frame.locator('button:has-text("LOGIN")').click()
+            page.wait_for_load_state("networkidle")
+            frame_unidade = None
+            for _ in range(10):
+                frame_unidade = encontrar_frame_com_texto(page, "Selecionar unidade")
+                if frame_unidade:
+                    break
+                page.wait_for_timeout(1000)
+            if not frame_unidade:
+                raise Exception("❌ Não encontrei 'Selecionar unidade'.")
+            frame_unidade.locator('text=Selecionar unidade').click()
+            page.wait_for_load_state("networkidle")
+            frame_unidade.evaluate("""
+                const menu = document.getElementById('barra_me_nu');
+                if (menu) {
+                    menu.style.marginLeft = '0px';
+                    menu.style.opacity = '1';
+                    menu.style.display = 'block';
+                }
+            """)
+            frame_unidade.locator('li[id="1152627"] > a').click()
+            with context.expect_page() as new_page_info:
+                frame_unidade.locator('li[id="472932"] > a').click()
+            multi_page = new_page_info.value
+            multi_page.wait_for_load_state("networkidle")
+            print("✅ Nova janela capturada")
+            frame_multi = encontrar_frame_com_texto(multi_page, "Localizar")
+            if not frame_multi:
+                raise Exception("❌ Não encontrei o frame com 'Localizar' na nova janela.")
+            frame_loc = encontrar_frame_localizar_input(multi_page)
+            frame_grid = encontrar_frame_grid_escalas(multi_page)
+            for idx, escala_nome in enumerate(escalas, start=1):
+                nomes = mapa_nomes.get(escala_nome, [])
+                print("\n" + "=" * 70)
+                print(f"🚀 [{idx}/{len(escalas)}] Escala: {escala_nome} | Funcionários: {len(nomes)}")
+                print("=" * 70)
+                abrir_localizar(frame_multi)
+                multi_page.wait_for_timeout(PAUSA_LOCALIZAR_MS)
+                filtrar_escala_no_localizar(frame_loc, multi_page, escala_nome)
+                frame_grid.locator(
+                    f'div.active-grid-row:has(div.searchString:has-text("{escala_nome}"))'
+                ).first.wait_for(state="visible", timeout=30000)
+                multi_page.wait_for_timeout(PAUSA_LOCALIZAR_MS)
+                abrir_escala_no_grid(frame_grid, multi_page, escala_nome)
+                frame_func = encontrar_frame_funcionarios(multi_page)
+                processar_nomes_na_escala(frame_func, nomes)
+                multi_page.wait_for_timeout(PAUSA_LOCALIZAR_MS)
+            print("\n🎉 Processo finalizado para todas as escalas!")
+            multi_page.wait_for_timeout(5000)
+        except Exception as e:
+            print("❌ ERRO:", e)
+            try:
+                page.screenshot(path="erro.png", full_page=True)
+                print("📸 Screenshot salvo: erro.png")
+            except:
+                pass
+            input("Pressione ENTER para fechar...")
+        finally:
+            browser.close()
+
+if __name__ == "__main__":
+    run()
