@@ -1,0 +1,503 @@
+# -*- coding: utf-8 -*-
+"""
+RPA RHID - Atribuição de Departamento em Funcionários
+-----------------------------------------------------
+Requisitos:
+- Python 3.10+
+- pip install playwright pandas openpyxl
+- python -m playwright install
+
+Planilha esperada:
+dados.xlsx
+Colunas:
+- NOME
+- DEPARTAMENTO
+"""
+
+from pathlib import Path
+from time import sleep
+import pandas as pd
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+
+
+# =========================
+# CONFIGURAÇÕES
+# =========================
+URL_LOGIN = "https://www.rhid.com.br/v2/#/login"
+URL_FUNCIONARIOS = "https://www.rhid.com.br/v2/#/list/person"
+
+ARQUIVO_PLANILHA = "{{ARQUIVO_PLANILHA}}"
+ARQUIVO_RETORNO = "{{ARQUIVO_RETORNO}}"
+
+HEADLESS = False
+SLOW_MO = 300
+TIMEOUT_PADRAO = 30000
+PROCESSAR_APENAS_PRIMEIRAS_LINHAS = None  # ex: 5
+
+
+# =========================
+# UTILITÁRIOS
+# =========================
+def log(msg: str):
+    print(msg, flush=True)
+
+
+def normalizar_texto(valor):
+    if pd.isna(valor):
+        return ""
+    return str(valor).strip()
+
+
+def aguardar_carregamento_geral(page, tempo_extra=1.0):
+    try:
+        page.wait_for_load_state("networkidle", timeout=10000)
+    except Exception:
+        pass
+    sleep(tempo_extra)
+
+
+def preencher_com_limpeza(locator, texto: str, timeout=10000):
+    locator.wait_for(state="visible", timeout=timeout)
+    locator.click()
+    try:
+        locator.fill("")
+    except Exception:
+        pass
+    try:
+        locator.press("Control+A")
+        locator.press("Backspace")
+    except Exception:
+        pass
+    locator.type(texto, delay=40)
+
+
+def clicar(locator, timeout=10000):
+    locator.wait_for(state="visible", timeout=timeout)
+    locator.click()
+
+
+def encontrar_input_busca(page):
+    candidatos = [
+        'input[type="search"][aria-controls="mydatatable"]',
+        '#mydatatable_filter input[type="search"]',
+        'input.form-control.form-control-sm[aria-controls="mydatatable"]',
+    ]
+    for sel in candidatos:
+        loc = page.locator(sel)
+        if loc.count() > 0:
+            return loc.first
+    raise Exception("Não encontrei o campo de busca da tabela de funcionários.")
+
+
+# =========================
+# NAVEGAÇÃO
+# =========================
+def abrir_menu_cadastros_e_funcionarios(page):
+    log("➡️ Acessando Cadastros > Funcionários...")
+
+    menu_cadastros = page.locator("span.m-menu__link-text", has_text="Cadastros")
+    if menu_cadastros.count() > 0:
+        try:
+            menu_cadastros.first.click()
+            sleep(1)
+        except Exception:
+            pass
+
+    link_funcionarios = page.locator('a[href="#/list/person"]')
+    if link_funcionarios.count() > 0:
+        try:
+            link_funcionarios.first.click()
+            aguardar_carregamento_geral(page, 2)
+            return
+        except Exception:
+            pass
+
+    item_funcionarios = page.locator("span.m-menu__link-text", has_text="Funcionários")
+    if item_funcionarios.count() > 0:
+        try:
+            item_funcionarios.first.click()
+            aguardar_carregamento_geral(page, 2)
+            return
+        except Exception:
+            pass
+
+    log("⚠️ Menu não respondeu como esperado. Tentando rota direta...")
+    page.goto(URL_FUNCIONARIOS, wait_until="domcontentloaded")
+    aguardar_carregamento_geral(page, 3)
+
+
+def garantir_pagina_funcionarios(page):
+    try:
+        page.locator("h3.m-portlet__head-text", has_text="Funcionários").wait_for(timeout=15000)
+        return
+    except Exception:
+        pass
+
+    try:
+        page.goto(URL_FUNCIONARIOS, wait_until="domcontentloaded")
+        page.locator("h3.m-portlet__head-text", has_text="Funcionários").wait_for(timeout=15000)
+        return
+    except Exception:
+        pass
+
+    raise Exception("Não foi possível abrir a página de Funcionários.")
+
+
+# =========================
+# TELA DE LISTA
+# =========================
+def pesquisar_funcionario(page, nome: str):
+    log(f"🔎 Pesquisando funcionário: {nome}")
+
+    campo_busca = encontrar_input_busca(page)
+    preencher_com_limpeza(campo_busca, nome)
+    sleep(1.5)
+    aguardar_carregamento_geral(page, 1.0)
+
+    linha = page.locator("#mydatatable tbody tr", has_text=nome)
+    if linha.count() == 0:
+        linha = page.locator("#mydatatable tbody tr")
+
+    if linha.count() == 0:
+        raise Exception(f"Nenhuma linha encontrada após pesquisar por '{nome}'.")
+
+    linha_escolhida = linha.first
+    texto_linha = linha_escolhida.inner_text().strip()
+
+    if "Nenhum" in texto_linha and "registro" in texto_linha.lower():
+        raise Exception(f"Nenhum funcionário encontrado para '{nome}'.")
+
+    return linha_escolhida
+
+
+def clicar_editar_na_linha(linha):
+    log("✏️ Clicando no lápis de edição...")
+
+    candidatos = [
+        'a[title="Editar"]',
+        'a[ng-click*="editItem"]',
+        'i.la.la-edit',
+    ]
+
+    for sel in candidatos:
+        loc = linha.locator(sel)
+        if loc.count() > 0:
+            try:
+                if sel == 'i.la.la-edit':
+                    loc.first.click()
+                else:
+                    loc.first.click()
+                return
+            except Exception:
+                pass
+
+    raise Exception("Não consegui encontrar o botão de editar na linha.")
+
+
+# =========================
+# TELA DE EDIÇÃO
+# =========================
+def aguardar_formulario_edicao(page):
+    log("🧾 Aguardando formulário de edição...")
+
+    candidatos = [
+        '#btnSave',
+        'button[name="btnSave"]',
+        'button:has-text("Salvar")',
+        'my-filter-select[parameter="idDepartment"]',
+        'my-filter-select[label="Departamento"]',
+    ]
+
+    for sel in candidatos:
+        loc = page.locator(sel)
+        if loc.count() > 0:
+            try:
+                loc.first.wait_for(state="visible", timeout=15000)
+                return
+            except Exception:
+                pass
+
+    raise Exception("Formulário de edição não carregou como esperado.")
+
+
+def encontrar_bloco_departamento(page):
+    """
+    Encontra especificamente o container do campo Departamento.
+    Ordem de tentativa:
+    1) my-filter-select[parameter="idDepartment"]
+    2) my-filter-select[label="Departamento"]
+    3) bloco que contém label 'Departamento'
+    """
+    log("🏢 Localizando bloco específico do Departamento...")
+
+    candidatos = [
+        'my-filter-select[parameter="idDepartment"]',
+        'my-filter-select[label="Departamento"]',
+    ]
+
+    for sel in candidatos:
+        loc = page.locator(sel)
+        if loc.count() > 0:
+            try:
+                loc.first.wait_for(state="visible", timeout=5000)
+                return loc.first
+            except Exception:
+                pass
+
+    # fallback por texto do label dentro do bloco
+    xpaths = [
+        'xpath=//my-filter-select[.//label[contains(normalize-space(.), "Departamento")]]',
+        'xpath=//*[contains(@class,"form-group") and .//label[contains(normalize-space(.), "Departamento")]]',
+    ]
+
+    for xp in xpaths:
+        loc = page.locator(xp)
+        if loc.count() > 0:
+            try:
+                loc.first.wait_for(state="visible", timeout=5000)
+                return loc.first
+            except Exception:
+                pass
+
+    raise Exception("Não encontrei o bloco do campo Departamento.")
+
+
+def encontrar_toggle_departamento(page):
+    """
+    Agora pega o ui-select-toggle SOMENTE dentro do bloco do Departamento.
+    """
+    bloco = encontrar_bloco_departamento(page)
+
+    candidatos = [
+        '.ui-select-container .ui-select-match .ui-select-toggle',
+        '.ui-select-toggle',
+        'span.btn.btn-default.form-control.ui-select-toggle',
+    ]
+
+    for sel in candidatos:
+        loc = bloco.locator(sel)
+        if loc.count() > 0:
+            for i in range(loc.count()):
+                item = loc.nth(i)
+                try:
+                    if item.is_visible():
+                        return item
+                except Exception:
+                    pass
+
+    raise Exception("Não encontrei o botão de abertura do seletor de Departamento.")
+
+
+def encontrar_input_busca_departamento(page):
+    """
+    Depois de abrir o seletor do Departamento, o input de busca aparece dentro do mesmo bloco.
+    """
+    bloco = encontrar_bloco_departamento(page)
+
+    candidatos = [
+        'input.ui-select-search',
+        '.ui-select-container input[type="search"]',
+        'input[aria-label="Escolher"]',
+        'input.form-control.ui-select-search',
+    ]
+
+    for sel in candidatos:
+        loc = bloco.locator(sel)
+        if loc.count() > 0:
+            for i in range(loc.count()):
+                item = loc.nth(i)
+                try:
+                    if item.is_visible():
+                        return item
+                except Exception:
+                    pass
+
+    # fallback global, mas somente se houver 1 input visível depois da abertura
+    loc = page.locator('input.ui-select-search:visible')
+    if loc.count() > 0:
+        return loc.last
+
+    raise Exception("Não encontrei o input de busca do Departamento.")
+
+
+def selecionar_departamento(page, departamento: str):
+    log(f"🏷️ Selecionando departamento: {departamento}")
+
+    toggle = encontrar_toggle_departamento(page)
+    toggle.click()
+    sleep(0.8)
+
+    input_departamento = encontrar_input_busca_departamento(page)
+    input_departamento.click()
+    sleep(0.3)
+
+    try:
+        input_departamento.fill("")
+    except Exception:
+        pass
+
+    try:
+        input_departamento.press("Control+A")
+        input_departamento.press("Backspace")
+    except Exception:
+        pass
+
+    input_departamento.type(departamento, delay=40)
+    sleep(1.2)
+
+    # Primeiro tenta selecionar uma opção visível com o texto do departamento
+    opcoes = [
+        page.locator(".ui-select-choices-row, .ui-select-choices-group, .ui-select-choices-content li", has_text=departamento),
+        page.locator(".dropdown-menu li", has_text=departamento),
+    ]
+
+    for grupo in opcoes:
+        if grupo.count() > 0:
+            try:
+                grupo.first.click()
+                sleep(1.0)
+                return
+            except Exception:
+                pass
+
+    # Se não conseguiu clicar na lista, usa ENTER
+    input_departamento.press("Enter")
+    sleep(1.0)
+
+
+def clicar_salvar(page):
+    log("💾 Salvando cadastro...")
+
+    candidatos = [
+        '#btnSave',
+        'button[name="btnSave"]',
+        'button:has-text("Salvar")',
+    ]
+
+    for sel in candidatos:
+        loc = page.locator(sel)
+        if loc.count() > 0:
+            try:
+                loc.first.click()
+                aguardar_carregamento_geral(page, 2.5)
+                return
+            except Exception:
+                pass
+
+    raise Exception("Não consegui clicar no botão Salvar.")
+
+
+def voltou_para_lista(page):
+    try:
+        page.locator("h3.m-portlet__head-text", has_text="Funcionários").wait_for(timeout=15000)
+        return True
+    except Exception:
+        return False
+
+
+def processar_linha(page, nome: str, departamento: str):
+    garantir_pagina_funcionarios(page)
+    linha = pesquisar_funcionario(page, nome)
+    clicar_editar_na_linha(linha)
+    aguardar_formulario_edicao(page)
+    selecionar_departamento(page, departamento)
+    clicar_salvar(page)
+
+    if not voltou_para_lista(page):
+        raise Exception("Após salvar, o sistema não retornou claramente para a tela de Funcionários.")
+
+
+# =========================
+# FLUXO PRINCIPAL
+# =========================
+def main():
+    caminho_planilha = Path(ARQUIVO_PLANILHA)
+    if not caminho_planilha.exists():
+        raise FileNotFoundError(f"Arquivo não encontrado: {ARQUIVO_PLANILHA}")
+
+    log("📄 Lendo planilha...")
+    df = pd.read_excel(caminho_planilha)
+
+    colunas_necessarias = ["NOME", "DEPARTAMENTO"]
+    for col in colunas_necessarias:
+        if col not in df.columns:
+            raise Exception(
+                f"A planilha precisa ter a coluna '{col}'. "
+                f"Colunas encontradas: {list(df.columns)}"
+            )
+
+    df["NOME"] = df["NOME"].apply(normalizar_texto)
+    df["DEPARTAMENTO"] = df["DEPARTAMENTO"].apply(normalizar_texto)
+    df["STATUS_RPA"] = ""
+    df["DETALHE_RPA"] = ""
+
+    df = df[(df["NOME"] != "") & (df["DEPARTAMENTO"] != "")].copy()
+
+    if PROCESSAR_APENAS_PRIMEIRAS_LINHAS:
+        df = df.head(PROCESSAR_APENAS_PRIMEIRAS_LINHAS).copy()
+
+    if df.empty:
+        raise Exception("A planilha não possui linhas válidas para processamento.")
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=HEADLESS, slow_mo=SLOW_MO)
+        context = browser.new_context(viewport={"width": 1600, "height": 900})
+        page = context.new_page()
+        page.set_default_timeout(TIMEOUT_PADRAO)
+
+        log("🌐 Abrindo sistema...")
+        page.goto(URL_LOGIN, wait_until="domcontentloaded")
+        aguardar_carregamento_geral(page, 2)
+
+        log("")
+        log("🟡 Faça login manual, informe senha e selecione a base/unidade.")
+        log("🟡 Quando terminar e estiver na tela principal do sistema, volte ao terminal.")
+        input("➡️ Pressione ENTER para o robô continuar... ")
+
+        aguardar_carregamento_geral(page, 2)
+        abrir_menu_cadastros_e_funcionarios(page)
+        garantir_pagina_funcionarios(page)
+
+        total = len(df)
+        log(f"🚀 Iniciando processamento de {total} registro(s)...")
+
+        for numero, (idx, row) in enumerate(df.iterrows(), start=1):
+            nome = row["NOME"]
+            departamento = row["DEPARTAMENTO"]
+
+            log("")
+            log("=" * 80)
+            log(f"Registro {numero}/{total}")
+            log(f"Funcionário: {nome}")
+            log(f"Departamento: {departamento}")
+
+            try:
+                processar_linha(page, nome, departamento)
+                df.at[idx, "STATUS_RPA"] = "OK"
+                df.at[idx, "DETALHE_RPA"] = "Departamento atribuído com sucesso."
+                log("✅ Concluído com sucesso.")
+
+            except Exception as e:
+                erro = str(e)
+                df.at[idx, "STATUS_RPA"] = "ERRO"
+                df.at[idx, "DETALHE_RPA"] = erro
+                log(f"❌ Erro ao processar '{nome}': {erro}")
+
+                try:
+                    page.goto(URL_FUNCIONARIOS, wait_until="domcontentloaded")
+                    aguardar_carregamento_geral(page, 2)
+                except Exception:
+                    pass
+
+            df.to_excel(ARQUIVO_RETORNO, index=False)
+
+        log("")
+        log("🏁 Processamento finalizado.")
+        log(f"📁 Resultado salvo em: {ARQUIVO_RETORNO}")
+
+        input("➡️ Pressione ENTER para fechar o navegador... ")
+        browser.close()
+
+
+if __name__ == "__main__":
+    main()
